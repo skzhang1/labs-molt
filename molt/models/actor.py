@@ -57,9 +57,30 @@ class Actor(BaseModel):
         - ``entropy``:          ``[B, S-1]`` — only when ``return_entropy`` (RL).
         - ``aux_loss``:         MoE load-balancing loss — only for NeMo custom MoE.
         """
-        output, rolled_sequences, cp_forward, indices, batch, seqlen = self._forward_backbone(
-            sequences, attention_mask, position_ids, cp_context_stack, mm_inputs, routed_experts=routed_experts
-        )
+        head_state = getattr(self, "logra_head", None)
+        if head_state is not None:
+            head_state.head_labels = sequences.roll(-1, dims=1)
+            head_state.head_want_entropy = return_entropy
+        try:
+            output, rolled_sequences, cp_forward, indices, batch, seqlen = self._forward_backbone(
+                sequences, attention_mask, position_ids, cp_context_stack, mm_inputs, routed_experts=routed_experts
+            )
+        finally:
+            if head_state is not None:
+                head_state.head_labels = None
+        if head_state is not None:
+            from .chunked_head import HeadOut
+
+            head_output = output["logits"]
+            if not isinstance(head_output, HeadOut):
+                raise RuntimeError("LOGRA chunked head unexpectedly fell back to full logits")
+            output["logits"] = None
+            output["log_probs"] = head_output.log_probs[:, :-1]
+            if return_entropy:
+                output["entropy"] = head_output.entropy[:, :-1]
+            if action_mask is not None:
+                output["action_log_probs"] = output["log_probs"][:, -action_mask.shape[1] :] * action_mask.float()
+            return output
         logits = output["logits"]
         full_logits = None
 

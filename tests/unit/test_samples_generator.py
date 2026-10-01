@@ -541,3 +541,33 @@ def test_without_partial_rollout_the_pool_holds_one_batch_and_drains(monkeypatch
     assert [sample.group_ids[0] for sample in samples] == ["p0", "p1", "p2"]
     assert prompts_dispatched == 3  # capacity 5, but only the batch's 3 prompts go out
     assert generator._inflight_rollouts == []  # pool drained: the refit sees no in-flight rollout
+
+
+def test_logra_sampling_separates_responses_and_preserves_eval_rng(monkeypatch):
+    generator = object.__new__(SamplesGenerator)
+    generator.args = SimpleNamespace(
+        train=SimpleNamespace(seed=1),
+        rollout=SimpleNamespace(n_samples_per_prompt=4),
+        algo=SimpleNamespace(advantage=SimpleNamespace(is_correction_level="off")),
+    )
+    seen = []
+
+    def capture(*args, **kwargs):
+        seen.append(getattr(args[3], "seed", None))
+        return None
+
+    generator.agent_runners = [SimpleNamespace(run_group=SimpleNamespace(remote=capture))]
+    generator._rr = 0
+    monkeypatch.setattr(samples_generator, "_gather_group", SimpleNamespace(remote=lambda *args: None))
+    generator._dispatch_to_agent_runners(["question"], ["answer"], logra_step=-1)
+    evaluation = list(seen)
+    assert len(set(evaluation)) == 4
+    seen.clear()
+    generator._dispatch_to_agent_runners(["question"], ["answer"], logra_step=17)
+    assert set(evaluation).isdisjoint(seen)
+    seen.clear()
+    generator._dispatch_to_agent_runners(["question"], ["answer"], logra_step=-1)
+    assert seen == evaluation
+    seen.clear()
+    generator._dispatch_to_agent_runners(["question"], ["answer"])
+    assert seen == [None] * 4

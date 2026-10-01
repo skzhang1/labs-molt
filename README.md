@@ -754,3 +754,7 @@ All commits must be signed off (`git commit -s`) per the
 
 [Apache License 2.0](LICENSE). Copyright and third-party attributions:
 [NOTICE](NOTICE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+## LOGRA
+
+See the [Math training recipe](examples/scripts/logra/README.md).

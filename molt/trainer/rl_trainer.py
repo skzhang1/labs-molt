@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import asyncio
+import json
 import os
 import statistics
 import time
@@ -74,12 +75,24 @@ def prepare_datasets(strategy, tokenizer):
 
     # Create train dataset
     train_data = train_data.select(range(min(args.data.max_samples, len(train_data))))
+    if args.actor.optim == "logra" and args.train.max_updates:
+        import numpy as np
+
+        generator = np.random.default_rng(args.train.seed)
+        count = (args.train.max_updates + 1) * args.rollout.batch_size
+        indices = []
+        while len(indices) < count:
+            indices.extend(generator.permutation(len(train_data)).tolist())
+        train_data = train_data.select(indices[:count])
+        os.makedirs(args.ckpt.path, exist_ok=True)
+        with open(os.path.join(args.ckpt.path, "prompt_schedule.json"), "w") as stream:
+            json.dump(indices[: args.train.max_updates * args.rollout.batch_size], stream)
     prompts_dataset = PromptDataset(train_data, tokenizer, strategy, prerender=prerender)
     prompts_dataloader = strategy.setup_dataloader(
         prompts_dataset,
         batch_size=1,
         pin_memory=True,
-        shuffle=True,
+        shuffle=args.actor.optim != "logra",
         collate_fn=prompts_dataset.collate_fn,
         num_workers=args.data.dataloader_num_workers,
     )
@@ -118,6 +131,8 @@ def prepare_datasets(strategy, tokenizer):
     else:
         steps = -(-len(prompts_dataset) * args.rollout.n_samples_per_prompt // args.train.batch_size)
         max_steps = steps * args.train.num_episodes * args.train.max_epochs
+    if args.train.max_updates:
+        max_steps = args.train.max_updates
     return prompts_dataloader, eval_dataloader, max_steps
 
 
@@ -513,6 +528,8 @@ class BaseRLTrainer:
             client_states["best_eval_metric_key"] = metric_key
             client_states["best_eval_metric_value"] = current_value
             client_states["checkpoint_metric_key"] = metric_key
+            if self.args.algo.advantage.estimator == "logra":
+                client_states["logra_baseline"] = self.experience_maker.logra_baseline
 
             tag = f"best_global_step{global_step}"
             refs = self.actor_model_group.async_run_method(
@@ -531,6 +548,10 @@ class BaseRLTrainer:
 
     def save_logs_and_checkpoints(self, global_step: int, logs_dict=None, client_states=None) -> None:
         logs_dict = logs_dict or {}
+        if self.args.actor.optim == "logra":
+            os.makedirs(self.args.ckpt.path, exist_ok=True)
+            with open(os.path.join(self.args.ckpt.path, "metrics.jsonl"), "a") as stream:
+                stream.write(json.dumps({"step": global_step, "kind": "train", **logs_dict}) + "\n")
         if global_step % self.args.logger.logging_steps == 0:
             if self.wandb_logger:
                 self.wandb_logger.log_train(global_step, logs_dict)
@@ -539,6 +560,8 @@ class BaseRLTrainer:
 
         # save ckpt
         client_states = client_states or {}
+        if self.args.algo.advantage.estimator == "logra":
+            client_states["logra_baseline"] = self.experience_maker.logra_baseline
         if global_step % self.args.ckpt.save_steps == 0:
             tag = f"global_step{global_step}"
             # Persist best-metric tracker on every rolling save so chain
@@ -574,6 +597,10 @@ class BaseRLTrainer:
                 "checkpoint_states: %s",
                 {k: v for k, v in checkpoint_states.items() if not isinstance(v, (dict, list))},
             )
+            if self.args.algo.advantage.estimator == "logra":
+                if "logra_baseline" not in checkpoint_states:
+                    raise ValueError("LOGRA resume requires the saved reward baseline")
+                self.experience_maker.logra_baseline = checkpoint_states["logra_baseline"]
             return checkpoint_states
         return {
             "episode": 0,
@@ -750,6 +777,11 @@ class GenerateSamplesActor:
                     self.rollout_queue.put(("eval", global_step, eval_metrics), block=True)
                     continue
 
+                limits = [n for n in (self.args.train.max_updates, self.args.train.stop_after_updates) if n > 0]
+                if limits and global_step >= min(limits):
+                    self.rollout_queue.put("done", block=True)
+                    return
+
                 if self.args.train.rollout_replay_dir:
                     # Debug: replay dumped rollout batches (train-only) to iterate on the
                     # training/refit path without regenerating. When the dumps run out, report
@@ -768,10 +800,15 @@ class GenerateSamplesActor:
                         ray.get(self.vllm_lock.acquire.remote())
                     try:
                         t0 = time.time()
+                        generation_kwargs = dict(self.generate_kwargs)
+                        if self.args.actor.optim == "logra":
+                            generation_kwargs["logra_step"] = global_step
                         rollout_samples, rollout_metrics, prompts_consumed, is_exhausted = (
-                            self.samples_generator.generate_samples(**self.generate_kwargs)
+                            self.samples_generator.generate_samples(**generation_kwargs)
                         )
                         generation_time = time.time() - t0
+                        if self.args.actor.optim == "logra":
+                            rollout_metrics["logra/rollout_policy_step"] = global_step
                         total_consumed_prompts += prompts_consumed
                     finally:
                         if not self._partial_rollout:
@@ -818,6 +855,8 @@ class GenerateSamplesActor:
             override = getattr(self.args.eval, key)
             if override is not None:
                 eval_kwargs[key] = override
+        if self.args.actor.optim == "logra":
+            eval_kwargs["logra_step"] = -1
         samples_list = self.samples_generator.generate_eval_samples(**eval_kwargs)
         return compute_eval_metrics(self.eval_dataloader, samples_list, eval_n)
 
@@ -877,6 +916,10 @@ class TrainingActor(BaseRLTrainer):
                 _, eval_step, eval_metrics = payload
                 self.rollout_slots.put(global_step, block=True)
                 logger.info(f"Eval at step {eval_step}: {eval_metrics}")
+                if self.args.actor.optim == "logra":
+                    os.makedirs(self.args.ckpt.path, exist_ok=True)
+                    with open(os.path.join(self.args.ckpt.path, "metrics.jsonl"), "a") as stream:
+                        stream.write(json.dumps({"step": eval_step, "kind": "eval", **eval_metrics}) + "\n")
                 if self.wandb_logger:
                     self.wandb_logger.log_eval(eval_step, eval_metrics)
                 if self.tensorboard_logger:
@@ -975,6 +1018,7 @@ class RLTrainer:
             raise ValueError(f"async_queue_size must be positive, got {queue_size}")
         logger.info(f"async_queue_size={queue_size}")
 
+        self._logra = strategy.args.actor.optim == "logra"
         self.rollout_queue = Queue(maxsize=queue_size)
         self.rollout_slots = Queue(maxsize=queue_size)
         for _ in range(queue_size):
@@ -1020,6 +1064,10 @@ class RLTrainer:
         start_episode = checkpoint_states.get("episode", 0)
         global_step = checkpoint_states.get("global_step", 0)
         total_consumed_prompts = checkpoint_states.get("total_consumed_prompts", 0)
+        if self._logra:
+            for _ in range(self.rollout_slots.qsize()):
+                self.rollout_slots.get(block=True)
+                self.rollout_slots.put(global_step, block=True)
         if global_step > 0:
             ray.get(
                 [

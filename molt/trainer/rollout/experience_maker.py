@@ -67,6 +67,7 @@ class RemoteExperienceMaker:
 
         self.strategy = strategy
         self.args = strategy.args
+        self.logra_baseline = 0.0
         self.advantage_estimator = strategy.args.algo.advantage.estimator
 
         self.actor_model_group = actor_model_group
@@ -242,8 +243,12 @@ class RemoteExperienceMaker:
             lam=args.algo.advantage.lam,
             values=[exp.values for exp in experiences] if needs_values else None,
             no_whiten=args.algo.advantage.no_whiten,
+            reward_baseline=self.logra_baseline if self.advantage_estimator == "logra" else 0.0,
         )
         advantages, returns = get_advantage_estimator(self.advantage_estimator)(rewards, rollouts["groups"], ctx)
+        if self.advantage_estimator == "logra":
+            batch_reward = torch.where(rewards >= 0.5, 1.0, -0.01).mean().item()
+            self.logra_baseline = 0.9 * self.logra_baseline + 0.1 * batch_reward
 
         # Per-group reward std (on clipped rewards), broadcast to samples, for logging only.
         rollout_stds = torch.zeros_like(rewards)

@@ -465,3 +465,12 @@ class PolicyLoss(nn.Module):
             )
         policy_kl = masked_mean(-policy_log_ratio.detach(), action_mask, dim=None)
         return loss, reported_loss, clip_ratio, policy_kl, vllm_kl, is_filter_ratio
+
+
+@register_policy_loss("logra")
+def logra_policy_loss(ratio, advantages, log_probs, action_mask, **kwargs):
+    """Length-normalized REINFORCE; PolicyLoss applies rollout importance weights."""
+    log_probs = torch.where(action_mask.bool(), log_probs, 0.0)
+    length = action_mask.sum(-1, keepdim=True).clamp_min(1)
+    loss = -advantages * log_probs * (1024.0 / length)
+    return loss, log_probs.new_zeros(())

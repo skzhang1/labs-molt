@@ -64,6 +64,7 @@ class AdvantageContext:
     kls: List[torch.Tensor]  # per experience (B, L) per-token KL
     values: List[torch.Tensor] | None = None  # per experience (B, L) critic V(s) at collection (PPO/gae)
     no_whiten: bool = False  # skip whitening entirely: raw returns (no mean-center, no std)
+    reward_baseline: float = 0.0
 
 
 Estimator = Callable[
@@ -325,3 +326,11 @@ def gae(
     # remain the value-regression target A + V(s)).
     advantages = [a * m for a, m in zip(normalize_advantages(advantages, ctx), ctx.action_masks)]
     return advantages, returns
+
+
+@register_advantage_estimator("logra")
+def logra(rewards, groups, ctx):
+    """Single-response REINFORCE with a running reward baseline."""
+    rewards = torch.where(rewards >= 0.5, torch.ones_like(rewards), torch.full_like(rewards, -0.01))
+    advantages = broadcast_advantages(rewards - ctx.reward_baseline, ctx)
+    return advantages, advantages

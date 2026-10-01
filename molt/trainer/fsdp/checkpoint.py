@@ -319,7 +319,10 @@ class CheckpointManager:
         ckpt.save_model(model=model, weights_path=save_dir, tokenizer=None)
         optimizer = kwargs.get("optimizer")
         scheduler = kwargs.get("scheduler")
-        if optimizer is not None:
+        if optimizer is not None and getattr(model, "_logra_optimizer", None) is optimizer:
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            self._atomic_write_torch(os.path.join(save_dir, f"logra_rank{rank}.pt"), optimizer.state_dict())
+        elif optimizer is not None:
             ckpt.save_optimizer(optimizer=optimizer, model=model, weights_path=save_dir, scheduler=scheduler)
 
         if dist.is_initialized():
@@ -373,7 +376,11 @@ class CheckpointManager:
         ckpt.load_model(model=model, model_path=os.path.join(load_dir, "model"))
 
         optim_dir = os.path.join(load_dir, "optim")
-        if optimizer is not None:
+        if optimizer is not None and getattr(model, "_logra_optimizer", None) is optimizer:
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            path = os.path.join(load_dir, f"logra_rank{rank}.pt")
+            optimizer.load_state_dict(torch.load(path, map_location="cpu", weights_only=False))
+        elif optimizer is not None:
             if not os.path.isdir(optim_dir):
                 # Resuming with fresh Adam moments and a restarted LR schedule must be an explicit choice.
                 raise FileNotFoundError(

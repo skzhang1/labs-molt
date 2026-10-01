@@ -460,6 +460,7 @@ if __name__ == "__main__":
             "on_policy_distill",
             "gae",
             "flash_reinforce",
+            "logra",
         ],
         default="reinforce",
         help="Advantage estimation method: reinforce, rloo, reinforce_baseline, grpo, dr_grpo, "
@@ -571,7 +572,7 @@ if __name__ == "__main__":
         "--actor.loss_mode",
         type=str,
         default="ppo",
-        choices=["ppo", "cispo", "gspo"],
+        choices=["ppo", "cispo", "gspo", "logra"],
         help="Policy-gradient surrogate: ppo (clipped min(surr1,surr2), optionally --actor.dual_clip) or "
         "cispo (https://arxiv.org/abs/2506.13585 — clips only the upper side of the IS ratio, "
         "stop-gradient through that weight, gradient flows through log-probs only; pass "
@@ -790,6 +791,34 @@ if __name__ == "__main__":
     parser.add_argument("--train.batch_size", type=int, default=128, help="Global training batch size")
     parser.add_argument("--train.micro_batch_size", type=int, default=1, help="batch size per GPU")
     parser.add_argument("--train.max_tokens_per_gpu", type=int, default=16192)
+    parser.add_argument("--actor.logra.rank", type=int, default=256)
+    parser.add_argument("--actor.logra.projection", choices=["rademacher", "gaussian", "sparse"], default="rademacher")
+    parser.add_argument("--actor.logra.optimizer", choices=["rowadam", "sgd"], default="rowadam")
+    parser.add_argument("--actor.logra.kl_mode", choices=["off", "diag", "auto"], default="auto")
+    parser.add_argument("--actor.logra.kl_budget", type=float, default=2e-4)
+    parser.add_argument("--actor.logra.kl_budget_final", type=float, default=2e-5)
+    parser.add_argument("--actor.logra.kl_budget_steps", type=int, default=300)
+    parser.add_argument("--actor.logra.target_norm", type=float, default=6e-5)
+    parser.add_argument("--actor.logra.alpha_max", type=float, default=3.0)
+    parser.add_argument("--actor.logra.mismatch_ema", type=float, default=0.3)
+    parser.add_argument("--actor.logra.mismatch_floor", type=float, default=0.5)
+    parser.add_argument("--actor.logra.no_mismatch", action="store_true")
+    parser.add_argument("--actor.logra.fixed_projection", action="store_true")
+    parser.add_argument("--actor.logra.probe_sequences", type=int, default=2)
+    parser.add_argument("--actor.logra.probe_tokens", type=int, default=4096)
+    parser.add_argument("--actor.logra.head_chunk", type=int, default=1024)
+    parser.add_argument(
+        "--train.max_updates",
+        type=int,
+        default=0,
+        help="Stop after this many training updates; 0 uses the dataset/episode budget",
+    )
+    parser.add_argument(
+        "--train.stop_after_updates",
+        type=int,
+        default=0,
+        help="End this session at an absolute update index without changing the training budget",
+    )
     parser.add_argument("--train.max_epochs", type=int, default=1)
     parser.add_argument("--train.num_episodes", type=int, default=1)
     parser.add_argument("--train.seed", type=int, default=42)

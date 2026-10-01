@@ -145,7 +145,9 @@ def add_optimizer_args(parser, prefix: str = "", default_adam_lr: float = 5e-6) 
     rather than skewing silently across the two launchers.
     """
     g = f"--{prefix}"
-    parser.add_argument(f"{g}optim", type=str, default="adam", choices=["adam", "muon"])
+    parser.add_argument(
+        f"{g}optim", type=str, default="adam", choices=["adam", "muon"] + (["logra"] if prefix == "actor." else [])
+    )
     # Muon 2D-weight group
     parser.add_argument(f"{g}muon.lr", type=float, default=0.02, help="LR for the Muon 2D-weight group")
     parser.add_argument(f"{g}muon.momentum", type=float, default=0.95)

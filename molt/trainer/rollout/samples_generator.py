@@ -484,12 +484,21 @@ class SamplesGenerator:
         for prompt, label, img, tool in zip(prompts, labels, images, tools):
             group_id = uuid4().hex
             parts = []
-            for _ in range(n_samples):
+            for sample_index in range(n_samples):
+                params = sampling_params
+                if "logra_step" in generate_kwargs:
+                    import hashlib
+                    from copy import deepcopy
+
+                    params = deepcopy(sampling_params)
+                    key = f"{self.args.train.seed}:{generate_kwargs['logra_step']}:{prompt}"
+                    seed = int.from_bytes(hashlib.sha256(key.encode()).digest()[:4], "little")
+                    params.seed = (seed + sample_index) % (2**32)
                 actor = self.agent_runners[self._rr % len(self.agent_runners)]
                 self._rr += 1
                 parts.append(
                     actor.run_group.remote(
-                        prompt, label, img, sampling_params, truncate_length, 1, tools=tool, group_id=group_id
+                        prompt, label, img, params, truncate_length, 1, tools=tool, group_id=group_id
                     )
                 )
             refs.append(_gather_group.remote(*parts))

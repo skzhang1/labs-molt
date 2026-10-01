@@ -118,6 +118,9 @@ class PolicyTrainer:
         # accumulated grad). Default ON to align with AutoModel's default; it trades
         # comm for higher peak memory, so set =0 for memory-bound runs that OOM.
         self._defer_grad_sync = os.environ.get("MOLT_DEFER_GRAD_SYNC", "1") == "1"
+        self.logra = actor_optim if self.args.actor.optim == "logra" else None
+        if self.logra is not None:
+            self._defer_grad_sync = False
         self.tokenizer = tokenizer
         self.dataloader_pin_memory = dataloader_pin_memory
 
@@ -289,6 +292,8 @@ class PolicyTrainer:
         device = torch.cuda.current_device()
 
         # Perf accounting: peak memory + FLOPs/MFU for this optimization phase.
+        if self.logra is not None:
+            torch.cuda.synchronize(device)
         torch.cuda.reset_peak_memory_stats(device)
         perf_t0 = time.time()
         local_seq_count = 0.0
@@ -385,6 +390,23 @@ class PolicyTrainer:
         status_mean.update(
             self.strategy.compute_perf_metrics(self._mfu, local_seq_count, local_token_sum, time.time() - perf_t0)
         )
+        if self.logra is not None:
+            torch.cuda.synchronize(device)
+            status_mean.update(
+                {
+                    f"logra/{key}": value
+                    for key, value in self.logra.last_stats.items()
+                    if isinstance(value, (int, float))
+                }
+            )
+            peak = torch.cuda.max_memory_allocated(device) / 2**30
+            status_mean["logra/peak_memory_gib"] = self.strategy.all_reduce(peak, op="max")
+            elapsed = self.strategy.all_reduce(time.time() - perf_t0, op="max")
+            tokens = self.strategy.all_reduce(local_token_sum, op="sum")
+            status_mean["logra/policy_update_seconds"] = elapsed
+            status_mean["logra/training_tokens"] = tokens
+            status_mean["logra/training_tokens_per_second"] = tokens / max(elapsed, 1e-9)
+            status_mean["logra/updates"] = self.logra.round
         return status_mean
 
     def training_step(
@@ -436,6 +458,10 @@ class PolicyTrainer:
             **multimodal_inputs,
         )
         action_log_probs = model_output["action_log_probs"]
+        if self.logra is not None:
+            self.logra.observe(
+                sequences, attention_mask, action_mask, action_log_probs, rollout_log_probs, experience.truncated
+            )
         if old_action_log_probs is None:
             # force_on_policy: experience_maker skipped the redundant old-logprob forward.
             # The batch is trained for one on-policy step, so old == this forward -> PPO
@@ -889,6 +915,19 @@ class PolicyModelActor(BaseModelActor):
             "scheduler_steps": max_steps,
         }
         self.actor, self.actor_optim, self.actor_scheduler = strategy.prepare((actor, actor_cfg))
+        if args.actor.optim == "logra":
+            from types import SimpleNamespace
+            from molt.models.chunked_head import install_chunked_head
+
+            self.actor.logra_head = SimpleNamespace(
+                head_labels=None,
+                head_temperature=self.actor.temperature,
+                head_chunk=args.actor.logra.head_chunk,
+                head_want_entropy=False,
+            )
+            head = self.actor.model.get_output_embeddings()
+            if not install_chunked_head(head, self.actor.logra_head):
+                raise ValueError("LOGRA could not install the chunked language-model head")
 
         # load checkpoint
         self.checkpoint_states = {}

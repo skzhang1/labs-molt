@@ -328,6 +328,94 @@ class FsdpStrategy:
 
     def _init_train_model(self, model, cfg: dict):
         train_model = self._unwrap_model(model)
+        if cfg["optim"] == "logra":
+            from molt.trainer.logra.optimizer import LograConfig, LograOptimizer
+            from molt.trainer.logra.sketch_linear import install_sketches
+            from molt.trainer.logra.kl_probe import KLProbe
+
+            if self.cp_size != 1 or self.tp_size != 1 or self.offload_optimizer:
+                raise ValueError("LOGRA currently requires FSDP with TP=CP=1 and no optimizer offload")
+            options = self.args.actor.logra
+            config = LograConfig(
+                rank=options.rank,
+                optimizer=options.optimizer,
+                proj_kind=options.projection,
+                base_seed=self.args.train.seed,
+                reseed=not options.fixed_projection,
+                merge_tokens=0,
+                max_sketch_norm=0,
+                max_update_ratio=options.target_norm,
+                betas=tuple(cfg["adam"]["betas"]),
+                kl_mode=options.kl_mode,
+                kl_budget=options.kl_budget,
+                kl_budget_final=options.kl_budget_final,
+                kl_budget_steps=options.kl_budget_steps,
+                kl_mismatch_adjust=not options.no_mismatch,
+                kl_mismatch_ema=options.mismatch_ema,
+                kl_mismatch_floor=options.mismatch_floor,
+                kl_alpha_max=options.alpha_max,
+                kl_check_tokens=0,
+                kl_probe_seqs=options.probe_sequences,
+                kl_probe_max_tokens=options.probe_tokens,
+            )
+            from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+                CheckpointImpl,
+                checkpoint_wrapper,
+            )
+            from molt.trainer.logra import sketch_linear
+
+            if model.packing_samples:
+                raise ValueError("LOGRA currently requires unpacked sequences")
+            containers = [
+                (name, module)
+                for name, module in train_model.named_modules()
+                if isinstance(module, (torch.nn.ModuleList, torch.nn.ModuleDict))
+                and name.endswith("layers")
+                and not any(word in name for word in ("visual", "vision", "mtp"))
+            ]
+            if not containers:
+                raise ValueError("LOGRA could not locate the language decoder blocks")
+            _, blocks = max(containers, key=lambda item: len(item[1]))
+            keys = list(blocks.keys()) if isinstance(blocks, torch.nn.ModuleDict) else range(len(blocks))
+            for key in keys:
+                if not hasattr(blocks[key], "_checkpoint_wrapped_module"):
+                    blocks[key] = checkpoint_wrapper(blocks[key], checkpoint_impl=CheckpointImpl.NO_REENTRANT)
+            raw_blocks = [getattr(blocks[key], "_checkpoint_wrapped_module", blocks[key]) for key in keys]
+            for index, key in enumerate(keys):
+                if index + 1 == len(raw_blocks):
+                    break
+                next_block = raw_blocks[index + 1]
+                if not callable(getattr(next_block, "reshard", None)):
+                    continue
+
+                def release_finished_block(module, inputs, output, next_block=next_block):
+                    if sketch_linear._in_backward():
+                        return
+                    tensor = output[0] if isinstance(output, (tuple, list)) else output
+                    if torch.is_tensor(tensor) and tensor.requires_grad:
+
+                        def release(gradient):
+                            next_block.reshard()
+                            return gradient
+
+                        tensor.register_hook(release)
+
+                blocks[key].register_forward_hook(release_finished_block)
+            train_model.config.use_cache = False
+            sketch_linear.SKIP_RECOMPUTE_STASH = True
+            if hasattr(torch._dynamo.config, "skip_fsdp_hooks"):
+                torch._dynamo.config.skip_fsdp_hooks = True
+            layers = install_sketches(train_model, config)
+            if not layers:
+                raise ValueError("LOGRA found no eligible weight matrices")
+            optimizer = LograOptimizer(layers, config)
+            optimizer.model = train_model
+            if options.kl_mode != "off":
+                optimizer.probe = KLProbe(options.probe_sequences, options.probe_tokens, check_tokens=0)
+            train_model._logra_optimizer = optimizer
+            self._max_norm_by_optimizer[id(optimizer)] = 0.0
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: 1.0)
+            return model, optimizer, scheduler
         params = [p for p in train_model.parameters() if p.requires_grad]
         if not params:
             raise ValueError("Cannot build optimizer: model has no trainable parameters")
@@ -457,6 +545,12 @@ class FsdpStrategy:
                 return
 
         model = self._unwrap_model(model)
+        if getattr(model, "_logra_optimizer", None) is optimizer:
+            optimizer.step()
+            self._last_grad_norm = optimizer.last_stats["sketch_norm"]
+            if scheduler is not None:
+                scheduler.step()
+            return
         params = [p for p in model.parameters() if p.grad is not None]
         self._last_grad_norm = 0.0
         # Clip/scale only when there are grads; the optimizer tail runs either way.
